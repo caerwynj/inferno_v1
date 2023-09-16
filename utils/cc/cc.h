@@ -4,6 +4,8 @@
 
 #pragma	lib	"../cc/cc.a$O"
 
+#define round	inf_round
+
 typedef	struct	Node	Node;
 typedef	struct	Sym	Sym;
 typedef	struct	Type	Type;

@@ -8,7 +8,7 @@
 
 #include	<sys/types.h>
 #include	<sys/stat.h>
-#include	<sys/fcntl.h>
+/* #include	<sys/fcntl.h> */
 #include	<utime.h>
 #include	"styx.h"
 #include	"stdio.h"

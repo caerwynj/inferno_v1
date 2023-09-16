@@ -1,16 +1,20 @@
+#include "lib9.h"
 #include	<sys/types.h>
 #include	<sys/socket.h>
 #include	<netinet/in.h>
 #include	<netdb.h>
 #include	<string.h>
+#include <stdlib.h>
 
 #include	"ip.h"
 #include	"error.h"
 
+/*  declared in lib9.h
 enum
 {
 	ERRLEN	= 64
 };
+*/
 
 /*
  * This file wraps up the system dependent network interface code.

@@ -1,0 +1,5 @@
+*.o
+*.out
+Linux/arm/bin/*
+*.a
+

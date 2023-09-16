@@ -5,8 +5,11 @@
 #
 # PREFIX_PKG	A staging area for collecting package files.
 #		This is not intended to be used for execution.
-
-ROOT_DEVEL=	/usr/inferno
-ROOT_PROD=	/usr/inferno
+SYSHOST=	Linux
+SYSTARG=	Linux
+OBJTYPE=	arm
+OBJDIR=		$SYSHOST/$OBJTYPE
+ROOT_DEVEL=	/home/pi/legacy/1e1src
+ROOT_PROD=	/home/pi/legacy/1e1src
 OBJDIR=		$SYSTARG/$OBJTYPE
 PREFIX_PKG=	$ROOT_DEVEL/package

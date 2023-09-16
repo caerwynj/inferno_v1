@@ -1,38 +1,46 @@
-
+#include	<pthread.h>
+#include	<signal.h>
 #include	"lib9.h"
 #include	"dat.h"
 #include	"fns.h"
 #include	"error.h"
-#include	<linux/sched.h>
+#include 	<sys/socket.h>
 #include	<time.h>
-#include	<termios.h>
-#include	<signal.h>
-#include 	<pwd.h>
-#include	<sys/ipc.h>
-#include	<sys/sem.h>
-#include	<asm/unistd.h>
 #include	<sys/time.h>
-
-static inline _syscall2(int, clone, unsigned long, flags, void*, childsp);
+#include	<termios.h>
+#include	<sys/sem.h>
+#include	<pwd.h>
+#include	<errno.h>
 
 enum
 {
-	KSTACK  = 32*1024,
-	DELETE	= 0x7f,
-	CTRLC	= 'C'-'@',
-	NSEMA	= 32
+	BUNCHES = 5000,
+	DELETE  = 0x7F
 };
 
-struct
+static pthread_key_t	prdakey;
+Lock mulock;
+ 
+int
+canlock(Lock *l)
 {
-	int	semid;
-	int	cnt;
-} sema = { -1, 0 };
+        int retval;
+        int hashkey;
+ 
+	while(!(mutexlock(&mulock)))
+		pthread_yield();
+ 
+        if(l->key)
+                retval=0;
+        else {
+                l->key=1;
+                retval=1;
+        }
+	mulock.key = 1;
+        return retval;
+}
 
-int	gidnobody = -1;
-int	uidnobody = -1;
-struct 	termios tinit;
-Proc*	uptab[NR_TASKS];
+
 
 void
 pexit(char *msg, int t)
@@ -51,31 +59,127 @@ pexit(char *msg, int t)
 		procs.tail = up->prev;
 	unlock(&procs.l);
 
-	/* print("pexit: %s: %s\n", up->text, msg);	/**/
 	e = up->env;
 	if(e != nil) {
 		closefgrp(e->fgrp);
 		closepgrp(e->pgrp);
 	}
-	exit(0);
+	pthread_exit(0);
 }
+
+void
+trapBUS(int signo, siginfo_t *info, void *context)
+{
+	if(info)
+		print("trapBUS: signo: %d code: %d addr: %lx\n",
+		info->si_signo, info->si_code, info->si_addr);
+	else
+		print("trapBUS: no info\n"); 
+	disfault(nil, "Bus error");
+}
+
+void
+trapUSR1(void)
+{
+	if(up->type != Interp)		/* Used to unblock pending I/O */
+		return;
+	if(up->intwait == 0)		/* Not posted so its a sync error */
+		disfault(nil, Eintr);	/* Should never happen */
+
+	up->intwait = 0;		/* Clear it so the proc can continue */
+}
+
+void
+trapILL(void)
+{
+	disfault(nil, "Illegal instruction");
+}
+
+void
+trapSEGV(void)
+{
+	disfault(nil, "Segmentation violation");
+}
+
+sigset_t set;
+setsigs()
+{
+	struct sigaction act;
+
+	memset(&act, 0 , sizeof(act));
+	sigemptyset(&set);
+	
+	act.sa_handler=SIG_IGN;
+	if(sigaction(SIGPIPE, &act, nil))
+	        panic("can't ignore sig pipe");
+
+	if(sigaddset(&set,SIGUSR1)== -1)
+		panic("sigaddset SIGUSR1");
+
+	if(sigaddset(&set,SIGUSR2)== -1)
+                panic("sigaddset SIGUSR2");
+
+	/* For the correct functioning of devcmd in the
+	 * face of exiting slaves
+	 */
+	if(sflag == 0) {
+		act.sa_handler=trapBUS;
+		act.sa_flags|=SA_SIGINFO;
+		if(sigaction(SIGBUS, &act, nil))
+			panic("sigaction SIGBUS");
+		act.sa_handler=trapILL;
+		if(sigaction(SIGILL, &act, nil))
+                        panic("sigaction SIGILL");
+		act.sa_handler=trapSEGV;
+		if(sigaction(SIGSEGV, &act, nil))
+                        panic("sigaction SIGSEGV");
+		if(sigaddset(&set,SIGINT)== -1)
+			panic("sigaddset");
+	}
+	if(sigprocmask(SIG_BLOCK,&set,nil)!= 0)
+		panic("sigprocmask");
+}
+
+static void *
+tramp(void *v)
+{
+	struct Proc *Up;
+	pthread_t thread;
+	struct sigaction oldact;
+
+	setsigs();
+	if(sigaction(SIGBUS, nil, &oldact))
+                panic("sigaction failed");
+        if(oldact.sa_handler!=trapBUS && sflag==0)
+                panic("3rd old act sa_handler");
+
+	if(pthread_setspecific(prdakey,v)) {
+		print("set specific data failed in tramp\n");
+		pthread_exit(0);
+	}
+	Up = v;
+ 	thread = pthread_self();
+	Up->sigid = cma_thread_get_unique(&thread);
+	/* attempt to catch signals again */
+	setsigs();
+	Up->func(Up->arg);
+	pexit("", 0);
+}
+
+pthread_t active_threads[BUNCHES]; /* this should be more than enuf */
 
 int
 kproc(char *name, void (*func)(void*), void *arg)
 {
-	int pid;
+	pthread_t thread;
+	pthread_attr_t attr;
+	int id;
 	Proc *p;
 	Pgrp *pg;
 	Fgrp *fg;
-	ulong *nsp;
-	static int sched;
+	struct sigaction oldact;
 
 	p = newproc();
-	nsp = malloc(KSTACK);
-	if(p == nil || nsp == nil) {
-		print("kproc(%s): no memory", name);
-		return;
-	}
 
 	pg = up->env->pgrp;
 	p->env->pgrp = pg;
@@ -93,9 +197,6 @@ kproc(char *name, void (*func)(void*), void *arg)
 	p->func = func;
 	p->arg = arg;
 
-	nsp += (KSTACK - sizeof(Proc*))/sizeof(*nsp);
-	*nsp = (ulong)p;
-
 	lock(&procs.l);
 	if(procs.tail != nil) {
 		p->prev = procs.tail;
@@ -107,119 +208,88 @@ kproc(char *name, void (*func)(void*), void *arg)
 	}
 	procs.tail = p;
 	unlock(&procs.l);
+	if((pthread_attr_create(&attr))== -1)
+		panic("pthread_attr_create failed");
 
-	/* print("clone: p=%lux sp=%lux\n", p, nsp);	/**/
+	errno=0;
+	pthread_attr_setsched(&attr,SCHED_OTHER);
+	if(errno)
+		panic("pthread_attr_setsched failed");
 
-	sched = 1;
+	if(pthread_create(&thread, attr, tramp, p))
+		panic("thr_create failed\n");
+        if(sigaction(SIGBUS, nil, &oldact))
+                panic("sigaction failed");
+        if(oldact.sa_handler!=trapBUS && sflag == 0)
+                panic("2nd old act sa_handler");
 
-	switch(clone(CLONE_VM|CLONE_FS|CLONE_FILES, nsp)) {
-	case -1:
-		panic("kproc: clone failed");
-		break;
-	case 0:
-		__asm__(	"movl	(%%esp), %%eax\n\t"
-				"movl	%%eax, (%%ebx)\n\t"
-				: /* no output */
-				: "bx"	(&uptab[gettss()])
-				: "eax"
-		);
-
-		/* print("child %d/%d up=%lux\n", NR_TASKS, gettss(), up);	/**/
-
-		if(gettss() > NR_TASKS)
-			panic("kproc: tss > NR_TASKS");
-
-		up->sigid = getpid();
-		sched = 0;
-		up->func(up->arg);
-		pexit("(main)", 0);
-	default:
-		while(sched)
-			sched_yield();
-	}
-
-	return 0;
-}
-
-void
-trapUSR1(int x)
-{
-	if(up->type != Interp)		/* Used to unblock pending I/O */
-		return;
-
-	if(up->intwait == 0)		/* Not posted so its a sync error */
-		disfault(nil, Eintr);	/* Should never happen */
-
-	up->intwait = 0;		/* Clear it so the proc can continue */
-}
-
-void
-trapILL(int x)
-{
-	disfault(nil, "Illegal instruction");
-}
-
-void
-trapBUS(int x)
-{
-	disfault(nil, "Bus error");
-}
-
-void
-trapSEGV(int x)
-{
-	disfault(nil, "Segmentation violation");
-}
-
-#include <fpuctl.h>
-void
-trapFPE(int x)
-{
-	print("FPU status=0x%.4lux", getfsr());
-	disfault(nil, "Floating exception");
+	if((id=cma_thread_get_unique(&thread))>=BUNCHES)
+		panic("id too big");
+	active_threads[id]=thread;
+	return id;
 }
 
 void
 oshostintr(Proc *p)
 {
-	kill(p->sigid, SIGUSR1);
+	pthread_cancel(active_threads[p->sigid]);
 }
+
+struct termios tinit;
+extern int wakeupkey;
 
 void
 cleanexit(int x)
 {
-	static int exiting;
+	USED(x);
 
-	if(exiting)
-		exit(0);
+	if(up->intwait) {
+		up->intwait = 0;
+		return;
+	}
 
-	exiting = 1;
-	print("exit(%d)\n", x);
-
+	if(wakeupkey)
+		if(semctl(wakeupkey,IPC_RMID,0))
+			print("failed to clean up semafore: %s\n",
+			strerror(errno));
 	tcsetattr(0, TCSANOW, &tinit);
-
-	if(sema.semid >= 0 && semctl(sema.semid, 0, IPC_RMID, 0) < 0)
-		print("emu: failed to remove semaphores id=%d: %r\n", sema.semid);
-
 	kill(0, SIGKILL);
 	exit(0);
 }
 
+int gidnobody= -1, uidnobody= -1;
+void
+getnobody()
+{
+	struct passwd *pwd;
+	
+	if(pwd=getpwnam("nobody")) {
+		uidnobody=pwd->pw_uid;
+		gidnobody=pwd->pw_gid;
+	}
+}
+
+static	pthread_mutex_t rendezvouslock;
+
 void
 libinit(char *imod)
 {
-	struct termios t;
-	struct sigaction act;
 	struct passwd *pw;
+	struct termios t;
+	struct Proc *Up;
+	struct sigaction oldact;
+	int ii;
+	int retval;
+	int *pidptr;
 
+	cma_init();
 	setsid();
+	mulock.key = 1; /* initialize to unlock */
+	if(pthread_mutex_init(&rendezvouslock,pthread_mutexattr_default))
+		panic("pthread_mutex_init");
 
 	gethostname(sysname, sizeof(sysname));
-	pw = getpwnam("nobody");
-	if(pw != nil) {
-		uidnobody = pw->pw_uid;
-		gidnobody = pw->pw_gid;
-	}
+	getnobody();
 
 	tcgetattr(0, &t);
 	tinit = t;
@@ -228,42 +298,32 @@ libinit(char *imod)
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
 	tcsetattr(0, TCSANOW, &t);
-	memset(&act, 0 , sizeof(act));
-	act.sa_handler=trapUSR1;
-	sigaction(SIGUSR1, &act, nil);
 
-	/* For the correct functioning of devcmd in the
-	 * face of exiting slaves
-	 */
-	signal(SIGPIPE, SIG_IGN);
-	if(sflag == 0) {
-		act.sa_handler=trapBUS;
-		sigaction(SIGBUS, &act, nil);
-		act.sa_handler=trapILL;
-		sigaction(SIGILL, &act, nil);
-		act.sa_handler=trapSEGV;
-		sigaction(SIGSEGV, &act, nil);
-		act.sa_handler = trapFPE;
-		sigaction(SIGFPE, &act, nil);
-
-		signal(SIGINT, cleanexit);
+	setsigs();
+	if(sigaction(SIGBUS, nil, &oldact)) {
+                panic("sigaction failed");
 	}
+        if(oldact.sa_handler!=trapBUS && sflag == 0)
+                panic("1st old act sa_handler");
 
-	uptab[gettss()] = newproc();
+	if(pthread_keycreate(&prdakey,NULL))
+		print("keycreate failed\n");
+
+	Up = newproc();
+	if(pthread_setspecific(prdakey,Up))
+		panic("set specific thread data failed\n");
 
 	pw = getpwuid(getuid());
-	if(pw != nil) {
-		if (strlen(pw->pw_name) + 1 <= NAMELEN)
-			strcpy(eve, pw->pw_name);
-		else
-			print("pw_name too long\n");
-	}
-	else
-		print("cannot getpwuid\n");
-
+        if(pw != nil)
+                if (strlen(pw->pw_name) + 1 <= NAMELEN)
+                        strcpy(eve, pw->pw_name);
+                else
+                        print("pw_name too long\n");
+        else
+                print("cannot getpwuid\n");
+ 
 	up->env->uid = getuid();
 	up->env->gid = getgid();
-
 	emuinit(imod);
 }
 
@@ -284,9 +344,6 @@ readkbd(void)
 		buf[0] = '\n';
 		break;
 	case DELETE:
-		buf[0] = 'H' - '@';
-		break;
-	case CTRLC:
 		cleanexit(0);
 		break;
 	}
@@ -304,14 +361,14 @@ struct Tag
 {
 	void*	tag;
 	ulong	val;
+	int	pid;
 	Tag*	hash;
 	Tag*	free;
-	int	sema;
+	pthread_cond_t cv;
 };
 
 static	Tag*	ht[NHASH];
 static	Tag*	ft;
-static	Lock	hlock;
 
 int
 rendezvous(void *tag, ulong value)
@@ -319,61 +376,47 @@ rendezvous(void *tag, ulong value)
 	int h;
 	ulong rval;
 	Tag *t, *f, **l;
-	union semun sun;
-	struct sembuf sop;
-
-	sop.sem_flg = 0;
+	int ii=0;
 
 	h = (ulong)tag & (NHASH-1);
 
-	lock(&hlock);
+	if(pthread_mutex_lock(&rendezvouslock))
+		panic("pthread_mutex_lock");
+
 	l = &ht[h];
 	for(t = *l; t; t = t->hash) {
 		if(t->tag == tag) {
 			rval = t->val;
 			t->val = value;
 			t->tag = 0;
-			unlock(&hlock);
-
-			sop.sem_num = t->sema;
-			sop.sem_op = 1;
-			semop(sema.semid, &sop, 1);
+			if(pthread_mutex_unlock(&rendezvouslock))
+				panic("pthread_mutex_unlock");
+			if(pthread_cond_signal(&(t->cv)))
+				panic("pthread_cond_signal");
 			return rval;		
 		}
 	}
 
 	t = ft;
-	if(t == nil) {
-		if(sema.semid < 0) {
-			sema.semid = semget(IPC_PRIVATE, NSEMA, IPC_CREAT|0700);
-			if(sema.semid < 0)
-				panic("rendezvous: failed to allocate semaphore pool: %r");
-		}
+	if(t == 0)
 		t = malloc(sizeof(Tag));
-		t->sema = sema.cnt++;
-		if(sema.cnt >= NSEMA)
-			panic("rendezvous: out of semaphores");
-	}
 	else
 		ft = t->free;
 
 	t->tag = tag;
 	t->val = value;
 	t->hash = *l;
+	if(pthread_cond_init(&(t->cv),pthread_condattr_default)) {
+		print("pthread_cond_init (errno: %s) \n", strerror(errno));
+		panic("pthread_cond_init");
+	}
 	*l = t;
 
-	sun.val = 0;
-	if(semctl(sema.semid, t->sema, SETVAL, sun) < 0)
-		panic("semctl: %r");
-	unlock(&hlock);
+	while(t->tag)
+		pthread_cond_wait(&(t->cv),&rendezvouslock);
 
-	sop.sem_num = t->sema;
-	sop.sem_op = -1;
-	semop(sema.semid, &sop, 1);
-
-	lock(&hlock);
 	rval = t->val;
-	for(f = *l; f; f = f->hash) {
+	for(f = *l; f; f = f->hash){
 		if(f == t) {
 			*l = f->hash;
 			break;
@@ -382,9 +425,81 @@ rendezvous(void *tag, ulong value)
 	}
 	t->free = ft;
 	ft = t;
-	unlock(&hlock);
+	if(pthread_mutex_unlock(&rendezvouslock))
+		panic("pthread_mutex_unlock");
 
 	return rval;
+}
+
+static char*
+month[] =
+{
+	"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+int
+timeconv(va_list *arg, Fconv *f)
+{
+	struct tm *tm;
+	time_t t;
+	struct tm rtm;
+	char buf[64];
+
+	t = va_arg(*arg, long);
+	tm =localtime_r(&t, &rtm);
+
+	sprint(buf, "%s %2d %-.2d:%-.2d",
+		month[tm->tm_mon], tm->tm_mday, tm->tm_hour, tm->tm_min);
+
+	strconv(buf, f);
+	return sizeof(long);
+}
+
+static char*
+modes[] =
+{
+	"---",
+	"--x",
+	"-w-",
+	"-wx",
+	"r--",
+	"r-x",
+	"rw-",
+	"rwx",
+};
+
+static void
+rwx(long m, char *s)
+{
+	strncpy(s, modes[m], 3);
+}
+
+int
+dirmodeconv(va_list *arg, Fconv *f)
+{
+	static char buf[16];
+	ulong m;
+
+	m = va_arg(*arg, ulong);
+
+	if(m & CHDIR)
+		buf[0]='d';
+	else if(m & CHAPPEND)
+		buf[0]='a';
+	else
+		buf[0]='-';
+	if(m & CHEXCL)
+		buf[1]='l';
+	else
+		buf[1]='-';
+	rwx((m>>6)&7, buf+2);
+	rwx((m>>3)&7, buf+5);
+	rwx((m>>0)&7, buf+8);
+	buf[11] = 0;
+
+	strconv(buf, f);
+	return(sizeof(ulong));
 }
 
 typedef struct Targ Targ;
@@ -396,9 +511,20 @@ struct Targ
 };
 
 void
+closeall(int fd) 
+{
+	int nfd, i;
+
+	nfd = getdtablesize();
+	for(i = 0; i < nfd; i++)
+		if(i != fd)
+			close(i);
+}
+
+void
 exectramp(Targ *targ)
 {
-	int fd, i, nfd, error, uid, gid;
+	int fd;
 	char *argv[4], buf[MAXDEVCMD];
 
 	fd = targ->fd;
@@ -412,50 +538,45 @@ exectramp(Targ *targ)
 	argv[3] = nil;
 
 	print("devcmd: '%s' pid %d\n", buf, getpid());
-	gid=up->env->gid;
-	uid=up->env->gid;
 
 	switch(fork()) {
+	int error;
 	case -1:
 		print("%s\n",strerror(errno));
 	default:
 		return;
 	case 0:
-		nfd = getdtablesize();
-		for(i = 0; i < nfd; i++)
-			if(i != fd)
-				close(i);
-
+		closeall(fd);
 		dup2(fd, 0);
 		dup2(fd, 1);
 		dup2(fd, 2);
 		close(fd);
 		error=0;
-		if(gid != -1)
-			error=setgid(gid);
-		else
-			error=setgid(gidnobody);
-
-		if((error)&&(geteuid()==0)){
-			print(
-			"devcmd: root can't set gid: %d or gidnobody: %d\n",
-			up->env->gid,gidnobody);
-			_exit(0);
-		}
-		
-		error=0;
-		if(uid != -1)
-			error=setuid(uid);
-		else
-			error=setuid(uidnobody);
-
-		if((error)&&(geteuid()==0)){
-			print(
-			"devcmd: root can't set uid: %d or uidnobody: %d\n",
-                        up->env->uid,uidnobody);
-			_exit(0);
+		if(up->env->gid != -1)
+                        error=setgid(up->env->gid);
+                else
+                        error=setgid(gidnobody);
+ 
+                if((error)&&(geteuid()==0)) {
+                        print(
+                        "devcmd: root can't set gid: %d or gidnobody: %d\n",
+                        up->env->gid,gidnobody);
+                        _exit(0);
                 }
-		
+ 
+                error=0;
+                if(up->env->uid != -1)
+                        error=setuid(up->env->uid);
+                else
+                        error=setuid(uidnobody);
+ 
+                if((error)&&(geteuid()==0)) {
+                        print(
+                        "devcmd: root can't set uid: %d or uidnobody: %d\n",
+                        up->env->uid,uidnobody);
+                        _exit(0);
+                }
+	
 		execv(argv[0], argv);
 		print("%s\n",strerror(errno));
 		/* don't flush buffered i/o twice */
@@ -473,7 +594,7 @@ oscmd(char *cmd, int *rfd, int *sfd)
 	if(bipipe(fd) < 0)
 		return -1;
 
-	signal(SIGCLD, SIG_DFL);
+	signal(_SIGCLD, SIG_DFL);
 
 	targ.fd = fd[0];
 	targ.cmd = cmd;
@@ -496,13 +617,12 @@ osmillisec(void)
 	struct timeval t;
 
 	if(gettimeofday(&t,(struct timezone*)0)<0)
-		return 0;
-
-	if(sec0 == 0) {
+		return(0);
+	if(sec0==0) {
 		sec0 = t.tv_sec;
 		usec0 = t.tv_usec;
 	}
-	return (t.tv_sec-sec0)*1000+(t.tv_usec-usec0+500)/1000;
+	return((t.tv_sec-sec0)*1000+(t.tv_usec-usec0+500)/1000);
 }
 
 /*
@@ -515,16 +635,25 @@ osusectime(void)
 	return (vlong)time(0) * 1000000;
 }
 
+
 int
 osmillisleep(ulong milsec)
 {
         struct  timespec time;
+	time.tv_sec = milsec/1000;
+       	time.tv_nsec= (milsec%1000)*1000000;
+       	if(pthread_delay_np(&time)== -1)
+		panic("nanosleep failed\n");
+}
+	
+Proc *
+getup(void)
+{
+	void *vp;
 
-        time.tv_sec = milsec/1000;
-        time.tv_nsec= (milsec%1000)*1000000;
-        nanosleep(&time,nil);
-
-	return 0;
+	vp=nil;
+	pthread_getspecific(prdakey,&vp);
+	return(vp);
 }
 
 ulong
@@ -536,91 +665,94 @@ getcallerpc(void *arg)
 void
 osyield(void)
 {
-	sched_yield();
+	pthread_yield();
 }
 
 void
 ospause(void)
 {
-        for(;;)
-                sleep(1000000);
-}
+	int s;
 
-ulong
-umult(ulong m1, ulong m2, ulong *hi)
-{
-	ulong lo;
-
-	__asm__(	"mull	%%ecx\n\t"
-			"movl	%%edx, (%%ebx)\n\t"
-			: "=a" (lo)
-			: "eax" (m1),
-			  "ecx" (m2),
-			  "ebx" (hi)
-			: "edx"
-	);
-	return lo;
-}
-
-int
-canlock(Lock *l)
-{
-	int	v;
-	
-	__asm__(	"movl	$1, %%eax\n\t"
-			"xchgl	%%eax,(%%ebx)"
-			: "=a" (v)
-			: "ebx" (&l->key)
-	);
-	switch(v) {
-	case 0:		return 1;
-	case 1: 	return 0;
-	default:	print("canlock: corrupted 0x%lux\n", v);
+	while(1) {
+		switch(s=sigwait(&set)) {
+		case SIGUSR1:
+			trapUSR1();
+		case SIGINT:
+			cleanexit(0);
+		default:
+			print("signal: %d %s\n",s, strerror(errno));
+			panic("sigwait");
+		}
 	}
-	return 0;
 }
 
-void
-FPsave(void *f)
-{
-	__asm__(	"fstenv	(%%eax)\n\t"
-			: /* no output */
-			: "eax"	(f)
-	);
-}
-
-void
-FPrestore(void *f)	
-{
-	__asm__(	"fldenv (%%eax)\n\t"
-			: /* no output */
-			: "eax"	(f)
-	);
-}
-
-static Rb rb;
+int wakeupkey = 0;
 extern int rbnotfull(void*);
+
+static int pid;
+static Rb *rbptr;
 
 void
 osspin(Rendez *prod)
 {
+	switch(pid=fork()){
+        case -1:
+                print("%s\n",strerror(errno));
+        default:
+                pthread_exit(0);
+        case 0:
+                closeall(1);
+		nice(20);
+		;
+	}
+
         for(;;){
-                if((rb.randomcount & 0xffff) == 0 && !rbnotfull(0)) {
-                        Sleep(prod, rbnotfull, 0);
+                if(!rbnotfull(0)) {
+			struct sembuf sop;
+
+			sop.sem_num = 0;
+			sop.sem_op  = -1;
+			sop.sem_flg = 0;
+			shmctl(wakeupkey,0,SETVAL,0);
+			if(semop(wakeupkey,&sop,1) == -1) 
+				print("semop failed errno=%d\n",errno);
                 }
-                rb.randomcount++;
+                rbptr->randomcount++;
         }
+}
+
+
+void
+oswakeupproducer(Rendez *rendez)
+{
+	struct sembuf sop[1];
+
+	sop[0].sem_num = 0;
+	sop[0].sem_op  = 1;
+	sop[0].sem_flg = 0;
+	if(semop(wakeupkey,sop,1) == -1) {
+		print("wakeup failed errno=%d wakeupkey: %d\n",errno,wakeupkey);
+		panic("oswakeupproducer");
+	}
+	sleep(0);
 }
 
 Rb*
 osraninit(void)
 {
-        return &rb;
-}
+	int shmidrb;
+	struct sembuf sop[1];
+	
+	if((shmidrb=shmget(IPC_PRIVATE,sizeof(Rb),0666)) == -1)
+                panic("could not get share memory for randombuf");
 
-void
-oswakeupproducer(Rendez *rendez)
-{
-        Wakeup(rendez);
+	if((rbptr=shmat(shmidrb,0,0)) == -1) {
+		print("errno=%d\n",errno);
+                panic("could not attach share memory for randombuf");
+	}
+	if((wakeupkey=semget(IPC_PRIVATE,1,IPC_CREAT|0666)) == -1) {
+		print("errno=%d\n",errno);
+                panic("could not get semop key");
+        }
+	return rbptr;
 }
-

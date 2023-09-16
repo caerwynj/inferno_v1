@@ -4,6 +4,8 @@
 #undef stdout
 extern Biobuf stdout;
 
+#define inline mk_inline
+
 typedef struct Bufblock
 {
 	struct Bufblock *next;

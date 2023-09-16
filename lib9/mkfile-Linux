@@ -14,7 +14,7 @@ OFILES=\
 	runestrlen.$O\
 	seek.$O\
 	strdup.$O\
-	strtoll.$O\
+#	strtoll.$O\
 	utflen.$O\
 	utfrrune.$O\
 	utfrune.$O\

@@ -1,0 +1,39 @@
+SYSTARG=Linux
+OBJTYPE=arm
+
+
+A=		a
+O=		o
+
+
+AR=		ar
+ARFLAGS=	crvs
+
+AS=		cc -c
+ASFLAGS=
+
+CC=		cc -c
+CFLAGS=\
+		$CFLAGS\
+		-g\
+		-O\
+		-I$ROOT_DEVEL/$SYSTARG/$OBJTYPE/include\
+		-I$ROOT_DEVEL/include\
+		-D_POSIX_C_SOURCE=199506L\
+		-D_XOPEN_SOURCE=500\
+		-D__STRICT_ANSI__\
+
+
+LD=		cc
+LDFLAGS=\
+		$LDFLAGS\
+		-L$ROOT_DEVEL/$SYSTARG/$OBJTYPE/lib\
+		-L/usr/openwin/lib\
+		-L/usr/X11R6/lib\
+
+LDSYSLIBS=	-lm -lX11
+
+RANLIB=		true
+
+YACC=		yacc
+YFLAGS=		-d

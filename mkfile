@@ -27,7 +27,7 @@ DIRS=\
 	memlayer\
 	asm\
 	appl\
-	tools\
+#	tools\
 	utils\
 	emu\
 
