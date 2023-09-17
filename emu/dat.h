@@ -27,6 +27,7 @@ typedef struct Rb	Rb;
 #include "os.h"
 #include "pool.h"
 
+
 typedef int    Devgen(Chan*, Dirtab*, int, int, Dir*);
 
 enum

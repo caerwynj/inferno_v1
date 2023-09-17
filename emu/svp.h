@@ -1,6 +1,7 @@
 #ifndef _SVP_H_
 #define _SVP_H_
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct _svp_t {
 	char*		s;	/* string */

@@ -2,4 +2,7 @@
 *.out
 Linux/arm/bin/*
 *.a
+*.dis
+*.sbl
+*.log
 

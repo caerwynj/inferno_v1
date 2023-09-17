@@ -1,4 +1,4 @@
-#define _POSIX_SOURCE
+#include <unistd.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <errno.h>

@@ -5,7 +5,7 @@
 #include	<netdb.h>
 #include	<string.h>
 #include <stdlib.h>
-
+#include "dat.h"
 #include	"ip.h"
 #include	"error.h"
 

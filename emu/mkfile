@@ -5,6 +5,8 @@
 TARG=emu
 
 OFILES=\
+	audio.$O\
+	audio-$SYSTARG.$O\
 	alloc.$O\
 	asm-$SYSTARG-$OBJTYPE.$O\
 	chan.$O\
@@ -37,6 +39,7 @@ OFILES=\
 	qio.$O\
 	srv.$O\
 	styx.$O\
+	svp.$O\
 	sysfile.$O\
 	win-$SYSTARG.$O\
 
@@ -65,7 +68,8 @@ HFILES=\
 
 <../$SYSTARG/mkone
 
-CFLAGS= -DEMU -I../interp $CFLAGS
+CFLAGS= -DEMU -I../interp $CFLAGS -pthread
+LDFLAGS=$LDFLAGS -pthread 
 
 devprog.$O \
 devsrv.$O \

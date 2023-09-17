@@ -11,6 +11,14 @@
 #include	<sys/sem.h>
 #include	<pwd.h>
 #include	<errno.h>
+#include <sys/shm.h>
+#include	<sched.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+
+#define pthread_yield() (sched_yield())
 
 enum
 {
@@ -24,20 +32,7 @@ Lock mulock;
 int
 canlock(Lock *l)
 {
-        int retval;
-        int hashkey;
- 
-	while(!(mutexlock(&mulock)))
-		pthread_yield();
- 
-        if(l->key)
-                retval=0;
-        else {
-                l->key=1;
-                retval=1;
-        }
-	mulock.key = 1;
-        return retval;
+	return _tas(&l->key) == 0;
 }
 
 
@@ -102,6 +97,8 @@ trapSEGV(void)
 }
 
 sigset_t set;
+
+void
 setsigs()
 {
 	struct sigaction act;
@@ -159,14 +156,12 @@ tramp(void *v)
 	}
 	Up = v;
  	thread = pthread_self();
-	Up->sigid = cma_thread_get_unique(&thread);
+	Up->sigid = thread;
 	/* attempt to catch signals again */
 	setsigs();
 	Up->func(Up->arg);
 	pexit("", 0);
 }
-
-pthread_t active_threads[BUNCHES]; /* this should be more than enuf */
 
 int
 kproc(char *name, void (*func)(void*), void *arg)
@@ -208,31 +203,29 @@ kproc(char *name, void (*func)(void*), void *arg)
 	}
 	procs.tail = p;
 	unlock(&procs.l);
-	if((pthread_attr_create(&attr))== -1)
-		panic("pthread_attr_create failed");
+	if((pthread_attr_init(&attr))== -1)
+		panic("pthread_attr_init failed");
 
 	errno=0;
-	pthread_attr_setsched(&attr,SCHED_OTHER);
+	pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	if(errno)
 		panic("pthread_attr_setsched failed");
 
-	if(pthread_create(&thread, attr, tramp, p))
+	if(pthread_create(&thread, &attr, tramp, p))
 		panic("thr_create failed\n");
         if(sigaction(SIGBUS, nil, &oldact))
                 panic("sigaction failed");
         if(oldact.sa_handler!=trapBUS && sflag == 0)
                 panic("2nd old act sa_handler");
 
-	if((id=cma_thread_get_unique(&thread))>=BUNCHES)
-		panic("id too big");
-	active_threads[id]=thread;
 	return id;
 }
 
 void
 oshostintr(Proc *p)
 {
-	pthread_cancel(active_threads[p->sigid]);
+	pthread_cancel(p->sigid);
 }
 
 struct termios tinit;
@@ -282,10 +275,9 @@ libinit(char *imod)
 	int retval;
 	int *pidptr;
 
-	cma_init();
 	setsid();
-	mulock.key = 1; /* initialize to unlock */
-	if(pthread_mutex_init(&rendezvouslock,pthread_mutexattr_default))
+	mulock.key = 0; /* initialize to unlock */
+	if(pthread_mutex_init(&rendezvouslock,NULL))
 		panic("pthread_mutex_init");
 
 	gethostname(sysname, sizeof(sysname));
@@ -306,7 +298,7 @@ libinit(char *imod)
         if(oldact.sa_handler!=trapBUS && sflag == 0)
                 panic("1st old act sa_handler");
 
-	if(pthread_keycreate(&prdakey,NULL))
+	if(pthread_key_create(&prdakey,NULL))
 		print("keycreate failed\n");
 
 	Up = newproc();
@@ -406,7 +398,7 @@ rendezvous(void *tag, ulong value)
 	t->tag = tag;
 	t->val = value;
 	t->hash = *l;
-	if(pthread_cond_init(&(t->cv),pthread_condattr_default)) {
+	if(pthread_cond_init(&(t->cv),NULL)) {
 		print("pthread_cond_init (errno: %s) \n", strerror(errno));
 		panic("pthread_cond_init");
 	}
@@ -594,7 +586,7 @@ oscmd(char *cmd, int *rfd, int *sfd)
 	if(bipipe(fd) < 0)
 		return -1;
 
-	signal(_SIGCLD, SIG_DFL);
+	signal(SIGCLD, SIG_DFL);
 
 	targ.fd = fd[0];
 	targ.cmd = cmd;
@@ -642,8 +634,8 @@ osmillisleep(ulong milsec)
         struct  timespec time;
 	time.tv_sec = milsec/1000;
        	time.tv_nsec= (milsec%1000)*1000000;
-       	if(pthread_delay_np(&time)== -1)
-		panic("nanosleep failed\n");
+	nanosleep(&time, NULL);
+	return 0;
 }
 	
 Proc *
@@ -652,7 +644,7 @@ getup(void)
 	void *vp;
 
 	vp=nil;
-	pthread_getspecific(prdakey,&vp);
+	vp = pthread_getspecific(prdakey);
 	return(vp);
 }
 
@@ -671,10 +663,11 @@ osyield(void)
 void
 ospause(void)
 {
-	int s;
+	int s, r;
 
 	while(1) {
-		switch(s=sigwait(&set)) {
+		r = sigwait(&set, &s);
+		switch(s) {
 		case SIGUSR1:
 			trapUSR1();
 		case SIGINT:
@@ -713,7 +706,7 @@ osspin(Rendez *prod)
 			sop.sem_num = 0;
 			sop.sem_op  = -1;
 			sop.sem_flg = 0;
-			shmctl(wakeupkey,0,SETVAL,0);
+			shmctl(wakeupkey,SETVAL,0);
 			if(semop(wakeupkey,&sop,1) == -1) 
 				print("semop failed errno=%d\n",errno);
                 }
@@ -755,4 +748,14 @@ osraninit(void)
                 panic("could not get semop key");
         }
 	return rbptr;
+}
+
+#define	SYS_cacheflush	__ARM_NR_cacheflush
+
+int
+segflush(void *a, ulong n)
+{
+	if(n)
+		syscall(SYS_cacheflush, a, (char*)a+n-1, 1);
+	return 0;
 }

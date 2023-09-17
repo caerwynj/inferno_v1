@@ -6,7 +6,6 @@
  * This structure must agree with FPsave and FPrestore asm routines
  */
 
-#include <unistd.h>
 #include <time.h>
 #include <sys/types.h>
 #include <grp.h>
